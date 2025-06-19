@@ -1,13 +1,20 @@
-use std::ffi::OsString;
+mod temp_path_builder;
+
+use std::env;
+use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Context, Error, Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+use libc::rmdir;
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
-use nix::unistd::sethostname;
+use nix::unistd::{chdir, pivot_root, sethostname};
+use temp_path_builder::TempPathBuilder;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = "Rust containerization software")]
@@ -19,11 +26,17 @@ struct Cli {
 #[derive(Debug, Subcommand, Clone)]
 enum Commands {
     Run {
-        #[arg()]
-        cmd: String,
         #[arg(long)]
+        /// Initial hostname to set inside the container
         hostname: Option<OsString>,
+        #[arg(long, short)]
+        /// Path to container root filesystem (will use a new mount namespace with old mounts if not specified)
+        rootfs: Option<PathBuf>,
         #[arg()]
+        /// Command to run inside the container
+        cmd: String,
+        #[arg()]
+        /// Arguments to pass to the command
         args: Vec<String>,
     },
 }
@@ -31,30 +44,83 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Commands::Run {
-        cmd,
         hostname,
         args,
+        rootfs,
+        cmd,
     } = cli.command;
 
-    run(cmd, hostname, args)
+    run(cmd, rootfs, hostname, args)
 }
 
-fn run(cmd: String, hostname: Option<OsString>, args: Vec<String>) -> Result<()> {
+fn run(
+    cmd: String,
+    rootfs: Option<PathBuf>,
+    hostname: Option<OsString>,
+    args: Vec<String>,
+) -> Result<()> {
     println!("Running command: {} with args: {:?}", cmd, args);
+
+    let term = env::var("TERM").unwrap_or("xterm".into());
 
     // SAFETY: TODO: Write this safety comment thouroughly explaining what you do in the `pre_exec`!
     let code = unsafe {
         Command::new(&cmd)
             .args(&args)
+            .env_clear()
+            .envs([
+                ("USER", "root"),
+                ("HOME", "/root"),
+                ("PATH", "/bin:/usr/bin"),
+                ("TERM", &term),
+            ])
             .pre_exec(move || {
                 println!("Child PID: {}", libc::getpid());
 
                 map_root()?;
 
+                // TODO: Figure out creating a new PID namespace
                 unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)?;
 
                 if let Some(ref hostname) = hostname {
                     sethostname(hostname)?;
+                }
+
+                if let Some(ref rootfs) = rootfs {
+                    let put_old = TempPathBuilder::new()
+                        .parent(rootfs)
+                        .prefix("put_old")
+                        .length(12)
+                        .build();
+                    std::fs::create_dir(&put_old)?; // Create directory for old_root mount
+
+                    // Bind mount rootfs over itself (as explained in `man 2 pivot_root`)
+                    mount(
+                        Some(rootfs),
+                        rootfs,
+                        None::<&str>,
+                        MsFlags::MS_BIND,
+                        None::<&str>,
+                    )?;
+                    // pivot_root call to change the root mount in the current (and new, from CLONE_NEWNS) mount namespace
+                    pivot_root(rootfs, &put_old)?;
+
+                    // Unmount the old root mount
+                    let mount_name = put_old.file_name().unwrap();
+                    let path_to_old_mount = PathBuf::from("/").join(mount_name);
+                    umount2(&path_to_old_mount, MntFlags::MNT_DETACH)?;
+                    // Finally, clean up by unlinking the put_old directory
+                    let path_to_old_mount_c =
+                        CString::new(path_to_old_mount.as_os_str().as_encoded_bytes())?;
+                    if rmdir(path_to_old_mount_c.as_ptr()) < 0 {
+                        return Err(io::Error::new(
+                            io::Error::last_os_error().kind(),
+                            "rmdir call failed",
+                        ));
+                    }
+
+                    // Switch directory to the new root dir
+                    chdir("/")?;
                 }
 
                 Ok(())
