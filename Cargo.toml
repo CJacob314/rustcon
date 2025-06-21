@@ -9,3 +9,4 @@ clap = { version = "4.5.40", features = ["derive"] }
 libc = "0.2.173"
 nix = { version = "0.30.1", features = ["sched", "hostname", "fs", "mount"] }
 rand = "0.9.1"
+clone_args_command.path = "./clone_args_command"
